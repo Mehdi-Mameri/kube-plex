@@ -1,0 +1,273 @@
+---
+# Source: kube-plex/templates/volumes.yaml
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mma-kube-plex-config
+  labels:
+    app: kube-plex
+    chart: kube-plex-0.2.7
+    release: mma
+    heritage: Tiller
+    component: config
+spec:
+  accessModes:
+  - "ReadWriteMany"
+  resources:
+    requests:
+      storage: "20Gi"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mma-kube-plex-data
+  labels:
+    app: kube-plex
+    chart: kube-plex-0.2.7
+    release: mma
+    heritage: Tiller
+    component: data
+spec:
+  accessModes:
+  - "ReadWriteMany"
+  resources:
+    requests:
+      storage: "500Gi"
+  storageClassName: "ibmc-file-retain-bronze"
+---
+
+---
+# Source: kube-plex/templates/rbac.yaml
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mma-kube-plex
+  labels:
+    app: kube-plex
+    chart: kube-plex-0.2.7
+    release: mma
+    heritage: Tiller
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - pods/attach
+  - pods/exec
+  - pods/portforward
+  - pods/proxy
+  verbs:
+  - create
+  - delete
+  - deletecollection
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mma-kube-plex
+  labels:
+    app: kube-plex
+    chart: kube-plex-0.2.7
+    release: mma
+    heritage: Tiller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mma-kube-plex
+subjects:
+- kind: ServiceAccount
+  name: mma-kube-plex
+  namespace: "default"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mma-kube-plex
+
+---
+# Source: kube-plex/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: mma-kube-plex
+  labels:
+    app: kube-plex
+    chart: kube-plex-0.2.7
+    release: mma
+    heritage: Tiller
+spec:
+  type: ClusterIP
+  ports:
+    - name: pms
+      port: 32400
+      protocol: TCP
+      targetPort: pms
+
+    - name: http
+      port: 80
+      targetPort: pms
+    - name: https
+      port: 443
+      targetPort: 32443
+  selector:
+    app: kube-plex
+    release: mma
+
+
+---
+# Source: kube-plex/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mma-kube-plex
+  labels:
+    app: kube-plex
+    chart: kube-plex-0.2.7
+    release: mma
+    heritage: Tiller
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: kube-plex
+      release: mma
+  template:
+    metadata:
+      labels:
+        app: kube-plex
+        release: mma
+    spec:
+      serviceAccountName: mma-kube-plex
+      hostname: "mma-kube-plex"
+      initContainers:
+      - name: kube-plex-install
+        image: "quay.io/munnerz/kube-plex:latest"
+        imagePullPolicy: Always
+        command:
+        - cp
+        - /kube-plex
+        - /shared/kube-plex
+        volumeMounts:
+        - name: shared
+          mountPath: /shared
+      containers:
+      - name: plex
+        image: "plexinc/pms-docker:1.16.0.1226-7eb2c8f6f"
+        imagePullPolicy: IfNotPresent
+        # We replace the PMS binary with a postStart hook to save having to
+        # modify the default image entrypoint.
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - bash
+              - -c
+              - |
+                #!/bin/bash
+                set -e
+                rm -f '/usr/lib/plexmediaserver/Plex Transcoder'
+                cp /shared/kube-plex '/usr/lib/plexmediaserver/Plex Transcoder'
+        readinessProbe:
+          httpGet:
+            path: /identity
+            port: 32400
+          initialDelaySeconds: 15
+          timeoutSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /identity
+            port: 32400
+          initialDelaySeconds: 10
+          timeoutSeconds: 10
+        ports:
+          - name: pms
+            containerPort: 32400
+          - name: http
+            containerPort: 32400
+          - name: https
+            containerPort: 32443
+        env:
+        - name: TZ
+          value: "Europe/London"
+        # TODO: move this to a secret?
+        - name: PLEX_CLAIM
+          value: ""
+        # kube-plex env vars
+        - name: PMS_INTERNAL_ADDRESS
+          value: http://mma-kube-plex:32400
+        - name: PMS_IMAGE
+          value: "plexinc/pms-docker:1.16.0.1226-7eb2c8f6f"
+        - name: KUBE_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: TRANSCODE_PVC
+          value: "mma-kube-plex-transcode"
+        - name: DATA_PVC
+          value: "mma-kube-plex-data"
+        - name: CONFIG_PVC
+          value: "mma-kube-plex-config"
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: config
+          mountPath: /config
+        - name: transcode
+          mountPath: /transcode
+        - name: shared
+          mountPath: /shared
+        resources:
+          {}
+          
+      nodeSelector:
+        beta.kubernetes.io/arch: amd64
+        
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: "mma-kube-plex-data"
+      - name: config
+        persistentVolumeClaim:
+          claimName: "mma-kube-plex-config"
+      - name: transcode
+        emptyDir: {}
+      - name: shared
+        emptyDir: {}
+
+---
+# Source: kube-plex/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mma-kube-plex
+  labels:
+    app: kube-plex
+    chart: kube-plex-0.2.7
+    release: mma
+    heritage: Tiller
+  annotations:
+      kubernetes.io/ingress.class: "iks-nginx"
+spec:
+  rules:
+    - host: mma.sixense-group.com
+      http:
+        paths:
+          - path: /
+            backend:
+              serviceName: mma-kube-plex
+              servicePort: https
+  tls:
+    - hosts:
+      - mma.sixense-group.com
+      secretName: tls-sixense-group
+    
